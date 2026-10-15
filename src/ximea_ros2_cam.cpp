@@ -97,6 +97,7 @@ XimeaRosCam::XimeaRosCam(const rclcpp::NodeOptions & options)
   num_cams_in_bus_         = this->declare_parameter("num_cams_in_bus", 1);
   bw_safety_ratio_         = this->declare_parameter("bw_safety_ratio", 0.9);
   transport_buffer_commit_ = this->declare_parameter("transport_buffer_commit", 32);
+  buffers_queue_size_      = this->declare_parameter("buffers_queue_size", 4);
   recent_frame_            = this->declare_parameter("recent_frame", true);
   warmup_frames_           = this->declare_parameter("warmup_frames", 10);
 
@@ -108,6 +109,10 @@ XimeaRosCam::XimeaRosCam(const rclcpp::NodeOptions & options)
   // toggles
   use_hardware_timestamps_ = this->declare_parameter("use_hardware_timestamps", false);
   hw_anchor_resync_period_s_ = this->declare_parameter("hw_anchor_resync_period_s", 60.0);
+  hw_anchor_min_latency_   = this->declare_parameter("hw_anchor_min_latency", true);
+  hw_clock_drift_ppm_      = this->declare_parameter("hw_clock_drift_ppm", 100.0);
+  timestamp_offset_s_      = this->declare_parameter("timestamp_offset_s", 0.0);
+  lag_warn_threshold_s_    = this->declare_parameter("lag_warn_threshold_s", 0.25);
   publish_xi_image_info_   = this->declare_parameter("publish_xi_image_info", false);
 
   auto & fmt_map = imageFormatMap();
@@ -146,25 +151,22 @@ XimeaRosCam::XimeaRosCam(const rclcpp::NodeOptions & options)
   // Global prerequisite: Enable bandwidth calculations for accurate querying later
   xiSetParamInt(0, XI_PRM_AUTO_BANDWIDTH_CALCULATION, XI_ON);
 
-  open_device_timer_ = this->create_wall_timer(
-    std::chrono::duration<double>(poll_open_period_s_),
-    std::bind(&XimeaRosCam::openDeviceCallback, this));
-
-  if (use_hardware_timestamps_ && hw_anchor_resync_period_s_ > 0.0) {
-    reanchor_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(hw_anchor_resync_period_s_),
-      [this]() {
-        hw_anchor_set_ = false;
-        RCLCPP_DEBUG(this->get_logger(),
-                    "HW timestamp anchor reset (period %.1f s)",
-                    hw_anchor_resync_period_s_);
-      });
-    RCLCPP_INFO(this->get_logger(),
-                "HW timestamp re-anchoring enabled, period=%.1f s",
-                hw_anchor_resync_period_s_);
-  }
-    
   RCLCPP_INFO(this->get_logger(), "Driver initialized. Polling for XIMEA camera Serial=%s", serial_no_.c_str());
+  if (use_hardware_timestamps_) {
+    if (hw_anchor_min_latency_) {
+      RCLCPP_INFO(this->get_logger(),
+                  "HW timestamps: min-latency anchoring (drift allowance %.0f ppm, offset %.4f s)",
+                  hw_clock_drift_ppm_, timestamp_offset_s_);
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "HW timestamps: legacy first-frame anchoring, re-anchor period=%.1f s",
+                  hw_anchor_resync_period_s_);
+    }
+  }
+
+  // Started last: both threads use the members initialised above.
+  capture_thread_ = std::thread(&XimeaRosCam::captureLoop, this);
+  publish_thread_ = std::thread(&XimeaRosCam::publishLoop, this);
 }
 
 XimeaRosCam::~XimeaRosCam() {
@@ -172,78 +174,80 @@ XimeaRosCam::~XimeaRosCam() {
 }
 
 void XimeaRosCam::shutdown() {
-  is_active_ = false;
-  hw_anchor_set_ = false;
-  warmup_count_ = 0;
+  {
+    std::lock_guard<std::mutex> lock(stop_mutex_);
+    stop_ = true;
+  }
+  stop_cv_.notify_all();
+  {
+    // Taking the lock orders the stop_ write before the publish thread's wait predicate
+    std::lock_guard<std::mutex> lock(slot_mutex_);
+  }
+  slot_cv_.notify_all();
 
-  if (open_device_timer_) {
-    open_device_timer_->cancel();
-    open_device_timer_.reset();
-  }
-  if (frame_capture_timer_) {
-    frame_capture_timer_->cancel();
-    frame_capture_timer_.reset();
-  }
-  if (reanchor_timer_) {
-    reanchor_timer_->cancel();
-    reanchor_timer_.reset();
-  }
+  if (capture_thread_.joinable()) capture_thread_.join();
+  if (publish_thread_.joinable()) publish_thread_.join();
+  closeDevice();
+}
 
-  std::lock_guard<std::mutex> lock(camera_mutex_);
-  if (xi_handle_) {
-    xiStopAcquisition(xi_handle_);
-    xiCloseDevice(xi_handle_);
-    xi_handle_ = nullptr;
-    RCLCPP_INFO(this->get_logger(), "Successfully closed XIMEA hardware device connection.");
+bool XimeaRosCam::sleepFor(double seconds) {
+  std::unique_lock<std::mutex> lock(stop_mutex_);
+  stop_cv_.wait_for(lock, std::chrono::duration<double>(seconds), [this]() { return stop_.load(); });
+  return !stop_;
+}
+
+void XimeaRosCam::captureLoop() {
+  // The first attempt happens one period after start, so cameras with different
+  // poll_open_period_s values open one after the other.
+  while (sleepFor(poll_open_period_s_)) {
+    if (!openDevice()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "Searching for camera %s...", serial_no_.c_str());
+      continue;
+    }
+    grabLoop();
+    closeDevice();
   }
 }
 
-void XimeaRosCam::openDeviceCallback() {
-  std::lock_guard<std::mutex> lock(camera_mutex_);
-  if (xi_handle_) return;
-
+bool XimeaRosCam::openDevice() {
   XI_RETURN stat;
   if (serial_no_.empty()) {
     stat = xiOpenDevice(0, &xi_handle_);
   } else {
     stat = xiOpenDeviceBy(XI_OPEN_BY_SN, serial_no_.c_str(), &xi_handle_);
   }
+  if (stat != XI_OK || !xi_handle_) {
+    xi_handle_ = nullptr;
+    return false;
+  }
 
-  if (stat == XI_OK && xi_handle_) {
-    if (!configureCamera()) {
-      RCLCPP_ERROR(this->get_logger(), "Failed to configure camera parameters. Aborting.");
-      xiCloseDevice(xi_handle_);
-      xi_handle_ = nullptr;
-      return;
-    }
+  if (!configureCamera()) {
+    RCLCPP_ERROR(this->get_logger(), "Failed to configure camera parameters. Aborting.");
+    closeDevice();
+    return false;
+  }
 
-    XI_RETURN as = xiStartAcquisition(xi_handle_);
-    if (as != XI_OK) {
-      RCLCPP_ERROR(get_logger(), "xiStartAcquisition failed with status %d", as);
-      xiCloseDevice(xi_handle_);
-      xi_handle_ = nullptr;
-      return;
-    }
+  XI_RETURN as = xiStartAcquisition(xi_handle_);
+  if (as != XI_OK) {
+    RCLCPP_ERROR(get_logger(), "xiStartAcquisition failed with status %d", as);
+    closeDevice();
+    return false;
+  }
 
-    is_active_ = true;
-    fail_count_ = 0;
-    warmup_count_ = 0;
-    open_device_timer_->cancel();
+  RCLCPP_INFO(this->get_logger(), "Successfully connected and started acquisition on camera SN=%s", serial_no_.c_str());
+  return true;
+}
 
-    if (frame_capture_timer_) {
-      frame_capture_timer_->cancel();
-    }
-
-    frame_capture_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(poll_frame_period_s_),
-      std::bind(&XimeaRosCam::frameCaptureCallback, this));
-      
-    RCLCPP_INFO(this->get_logger(), "Successfully connected and started acquisition on camera SN=%s", serial_no_.c_str());
-  } else {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-      "Searching for camera %s...", serial_no_.c_str());
+void XimeaRosCam::closeDevice() {
+  if (xi_handle_) {
+    xiStopAcquisition(xi_handle_);
+    xiCloseDevice(xi_handle_);
+    xi_handle_ = nullptr;
+    RCLCPP_INFO(this->get_logger(), "Closed XIMEA hardware device connection.");
   }
 }
+
 
 namespace {
   bool checkXi(rclcpp::Logger logger, XI_RETURN s, const char * what) {
@@ -373,9 +377,19 @@ bool XimeaRosCam::configureCamera() {
   }
 
   // -------- Performance & Buffer Tuning --------
-  int qsize_max = 0;
+  // A deep queue turns any slowdown into seconds of latency, so it is kept small by
+  // default. buffers_queue_size <= 0 selects the camera's maximum.
+  int qsize_min = 1, qsize_max = 0;
+  xiGetParamInt(xi_handle_, XI_PRM_BUFFERS_QUEUE_SIZE XI_PRM_INFO_MIN, &qsize_min);
   if (xiGetParamInt(xi_handle_, XI_PRM_BUFFERS_QUEUE_SIZE XI_PRM_INFO_MAX, &qsize_max) == XI_OK && qsize_max > 0) {
-    xiSetParamInt(xi_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, qsize_max);
+    const int lo = std::min(std::max(qsize_min, 1), qsize_max);
+    const int qsize = (buffers_queue_size_ <= 0) ? qsize_max : std::clamp(buffers_queue_size_, lo, qsize_max);
+    s = xiSetParamInt(xi_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, qsize);
+    if (s != XI_OK) {
+      RCLCPP_WARN(log, "Could not set buffers queue size to %d (status %d)", qsize, s);
+    } else {
+      RCLCPP_INFO(log, "xiAPI buffers queue size: %d (camera max %d)", qsize, qsize_max);
+    }
   }
 
   // Optimize transport buffer commit (for high framerates)
@@ -418,117 +432,217 @@ bool XimeaRosCam::configureCamera() {
   return true;
 }
 
-rclcpp::Time XimeaRosCam::hardwareToRosTime(uint32_t ts_sec, uint32_t ts_usec) {
-  const uint64_t hw_us = static_cast<uint64_t>(ts_sec) * 1000000ULL + ts_usec;
-  if (!hw_anchor_set_) {
-    hw_anchor_ros_time_ = this->now();
-    hw_anchor_us_ = hw_us;
-    hw_anchor_set_ = true;
-    return hw_anchor_ros_time_;
-  }
-  const int64_t delta_ns = static_cast<int64_t>(hw_us - hw_anchor_us_) * 1000LL;
-  return hw_anchor_ros_time_ + rclcpp::Duration::from_nanoseconds(delta_ns);
+void XimeaRosCam::resetTimestampState() {
+  lat_valid_ = false;
+  hw_anchor_set_ = false;
 }
 
-void XimeaRosCam::frameCaptureCallback() {
-  // Safe reconnect delegation (outside lock, avoids destroying self timer synchronously)
-  if (reconnect_pending_.exchange(false)) {
-    if (frame_capture_timer_) {
-      frame_capture_timer_->cancel();
-    }
-    open_device_timer_ = this->create_wall_timer(
-      std::chrono::duration<double>(poll_open_period_s_),
-      std::bind(&XimeaRosCam::openDeviceCallback, this));
-    return;
+int64_t XimeaRosCam::trackLatency(int64_t recv_ns, int64_t hw_ns) {
+  const int64_t d = recv_ns - hw_ns;
+  if (!lat_valid_ || hw_ns < lat_last_hw_ns_) {
+    // First frame, or the camera clock restarted
+    lat_offset_ns_ = d;
+    lat_valid_ = true;
+  } else {
+    // The minimum may creep upwards by the allowed clock drift so it can follow a
+    // slowly diverging camera/host clock, but not a queue backlog (which grows
+    // orders of magnitude faster). Anything lower is taken immediately.
+    lat_offset_ns_ += static_cast<int64_t>(
+      static_cast<double>(hw_ns - lat_last_hw_ns_) * hw_clock_drift_ppm_ * 1e-6);
+    if (d < lat_offset_ns_) lat_offset_ns_ = d;
   }
+  lat_last_hw_ns_ = hw_ns;
+  return d - lat_offset_ns_;
+}
 
-  if (!is_active_) return;
+int64_t XimeaRosCam::legacyAnchoredStamp(int64_t recv_ns, int64_t hw_ns) {
+  const int64_t hw_us = hw_ns / 1000;
+  if (hw_anchor_set_ && hw_anchor_resync_period_s_ > 0.0 &&
+      recv_ns - hw_anchor_ros_ns_ >= static_cast<int64_t>(hw_anchor_resync_period_s_ * 1e9)) {
+    hw_anchor_set_ = false;
+  }
+  if (!hw_anchor_set_) {
+    hw_anchor_ros_ns_ = recv_ns;
+    hw_anchor_us_ = hw_us;
+    hw_anchor_set_ = true;
+    return recv_ns;
+  }
+  return hw_anchor_ros_ns_ + (hw_us - hw_anchor_us_) * 1000LL;
+}
 
-  XI_IMG xi_img;
-  std::memset(&xi_img, 0, sizeof(xi_img));
-  xi_img.size = sizeof(XI_IMG);
+void XimeaRosCam::grabLoop() {
+  using steady = std::chrono::steady_clock;
+  constexpr int64_t kReportPeriodNs = 5'000'000'000LL;
+  const int64_t lag_warn_ns = static_cast<int64_t>(lag_warn_threshold_s_ * 1e9);
+  const int64_t ts_offset_ns = static_cast<int64_t>(timestamp_offset_s_ * 1e9);
+  const size_t frame_bytes_per_px = static_cast<size_t>(bytes_per_pixel_);
 
-  {
-    std::lock_guard<std::mutex> lock(camera_mutex_);
-    if (!xi_handle_ || xiGetImage(xi_handle_, img_capture_timeout_ms_, &xi_img) != XI_OK) {
-      if (++fail_count_ > 10) {
+  int fail_count = 0;
+  int warmup_count = 0;
+  int64_t window_start_ns = 0;
+  int64_t lag_max_ns = 0;
+  int64_t copy_max_ns = 0;
+  resetTimestampState();
+
+  while (!stop_) {
+    XI_IMG xi_img;
+    std::memset(&xi_img, 0, sizeof(xi_img));
+    xi_img.size = sizeof(XI_IMG);
+
+    const XI_RETURN s = xiGetImage(xi_handle_, img_capture_timeout_ms_, &xi_img);
+    const int64_t recv_ns = this->get_clock()->now().nanoseconds();
+
+    if (s != XI_OK || !xi_img.bp) {
+      if (++fail_count > 10) {
         RCLCPP_ERROR(this->get_logger(), "Lost connection to camera. Attempting reconnect...");
-        is_active_ = false;
-        hw_anchor_set_ = false;
-        if (xi_handle_) {
-          xiStopAcquisition(xi_handle_);
-          xiCloseDevice(xi_handle_);
-          xi_handle_ = nullptr;
-        }
-        fail_count_ = 0;
-        reconnect_pending_ = true;
+        return;
       }
-      return;
+      if (s != XI_TIMEOUT) sleepFor(0.01);  // avoid spinning on immediate errors
+      continue;
     }
-    fail_count_ = 0;
-  }
+    fail_count = 0;
 
-  // Discard warmup frames after startup/reconnect to let USB and auto-exposure settle,
-  // preventing initial latency from biasing the hardware timestamp anchor.
-  if (warmup_count_ < warmup_frames_) {
-    if (++warmup_count_ == warmup_frames_) {
-      RCLCPP_INFO(this->get_logger(), "Warmup complete (%d frames discarded). Streaming images.", warmup_frames_);
+    // Discard warmup frames after startup/reconnect to let USB and auto-exposure settle.
+    if (warmup_count < warmup_frames_) {
+      if (++warmup_count == warmup_frames_) {
+        RCLCPP_INFO(this->get_logger(), "Warmup complete (%d frames discarded). Streaming images.", warmup_frames_);
+      }
+      continue;
     }
-    return;
+
+    // ---- Timestamp ----
+    const int64_t hw_ns = (static_cast<int64_t>(xi_img.tsSec) * 1000000LL + xi_img.tsUSec) * 1000LL;
+    // Always tracked: how late this frame is compared with the best one seen. A queue
+    // backlog shows up here whether or not hardware timestamps are used.
+    const int64_t excess_ns = trackLatency(recv_ns, hw_ns);
+
+    int64_t stamp_ns;
+    if (!use_hardware_timestamps_) {
+      stamp_ns = recv_ns;
+    } else if (hw_anchor_min_latency_) {
+      stamp_ns = recv_ns - excess_ns;
+    } else {
+      stamp_ns = legacyAnchoredStamp(recv_ns, hw_ns);
+    }
+    stamp_ns += ts_offset_ns;
+    if (stamp_ns <= last_stamp_ns_) stamp_ns = last_stamp_ns_ + 1000;  // keep stamps increasing
+    last_stamp_ns_ = stamp_ns;
+
+    // ---- Hand the frame to the publish thread ----
+    const auto copy_t0 = steady::now();
+    PendingFrame frame;
+    const size_t payload_bytes =
+      static_cast<size_t>(xi_img.width) * frame_bytes_per_px * xi_img.height;
+    frame.data.assign(static_cast<const uint8_t *>(xi_img.bp),
+                      static_cast<const uint8_t *>(xi_img.bp) + payload_bytes);
+    frame.meta = xi_img;
+    frame.stamp_ns = stamp_ns;
+    copy_max_ns = std::max<int64_t>(copy_max_ns,
+      std::chrono::duration_cast<std::chrono::nanoseconds>(steady::now() - copy_t0).count());
+
+    {
+      std::lock_guard<std::mutex> lock(slot_mutex_);
+      if (slot_full_) ++stat_dropped_;   // publisher has not taken the previous frame yet
+      slot_ = std::move(frame);
+      slot_full_ = true;
+    }
+    slot_cv_.notify_one();
+
+    // ---- Health report: logged only when something is wrong ----
+    lag_max_ns = std::max(lag_max_ns, excess_ns);
+    if (window_start_ns == 0) window_start_ns = recv_ns;
+    if (recv_ns - window_start_ns >= kReportPeriodNs) {
+      const uint32_t dropped = stat_dropped_.exchange(0);
+      const double publish_max_ms = static_cast<double>(stat_publish_max_ns_.exchange(0)) * 1e-6;
+      const bool lagging = lag_warn_ns > 0 && lag_max_ns > lag_warn_ns;
+      if (lagging || dropped > 0) {
+        RCLCPP_WARN(this->get_logger(),
+          "Pipeline falling behind (last %.0f s): frame lag up to %.3f s (threshold %.3f s), "
+          "%u frame(s) dropped before publishing, publish() up to %.1f ms, frame copy up to %.1f ms.",
+          static_cast<double>(recv_ns - window_start_ns) * 1e-9,
+          static_cast<double>(lag_max_ns) * 1e-9, lag_warn_threshold_s_,
+          dropped, publish_max_ms, static_cast<double>(copy_max_ns) * 1e-6);
+      }
+      lag_max_ns = 0;
+      copy_max_ns = 0;
+      window_start_ns = recv_ns;
+    }
   }
+}
 
-  rclcpp::Time stamp = use_hardware_timestamps_ ? 
-    hardwareToRosTime(xi_img.tsSec, xi_img.tsUSec) : this->now();
+void XimeaRosCam::publishLoop() {
+  using steady = std::chrono::steady_clock;
+  while (true) {
+    PendingFrame f;
+    {
+      std::unique_lock<std::mutex> lock(slot_mutex_);
+      slot_cv_.wait(lock, [this]() { return slot_full_ || stop_.load(); });
+      if (stop_) return;
+      f = std::move(slot_);
+      slot_full_ = false;
+    }
 
-  auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
-  img_msg->header.stamp    = stamp;
-  img_msg->header.frame_id = frame_id_;
-  img_msg->height          = xi_img.height;
-  img_msg->width           = xi_img.width;
-  img_msg->encoding        = encoding_;
-  img_msg->step            = xi_img.width * bytes_per_pixel_;
-  
-  size_t payload_bytes     = img_msg->step * xi_img.height;
-  img_msg->data.resize(payload_bytes);
-  std::memcpy(img_msg->data.data(), xi_img.bp, payload_bytes);
+    const auto t0 = steady::now();
+    try {
+      const rclcpp::Time stamp(f.stamp_ns, RCL_ROS_TIME);
+      const XI_IMG & xi_img = f.meta;
 
-  auto info_msg = std::make_unique<sensor_msgs::msg::CameraInfo>(cam_info_manager_->getCameraInfo());
-  info_msg->header.stamp    = stamp;
-  info_msg->header.frame_id = frame_id_;
-  if (info_msg->width == 0) {
-    info_msg->width  = xi_img.width;
-    info_msg->height = xi_img.height;
-  }
+      auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
+      img_msg->header.stamp    = stamp;
+      img_msg->header.frame_id = frame_id_;
+      img_msg->height          = xi_img.height;
+      img_msg->width           = xi_img.width;
+      img_msg->encoding        = encoding_;
+      img_msg->step            = xi_img.width * bytes_per_pixel_;
+      img_msg->data            = std::move(f.data);
 
-  image_pub_.publish(std::move(*img_msg), std::move(*info_msg));
+      auto info_msg = std::make_unique<sensor_msgs::msg::CameraInfo>(cam_info_manager_->getCameraInfo());
+      info_msg->header.stamp    = stamp;
+      info_msg->header.frame_id = frame_id_;
+      if (info_msg->width == 0) {
+        info_msg->width  = xi_img.width;
+        info_msg->height = xi_img.height;
+      }
 
-  std_msgs::msg::UInt32 count_msg;
-  count_msg.data = ++frame_count_;
-  image_count_pub_->publish(count_msg);
+      image_pub_.publish(std::move(*img_msg), std::move(*info_msg));
 
-  if (publish_xi_image_info_) {
-    auto info_msg_custom = std::make_unique<ximea_ros2_cam::msg::XiImageInfo>();
-    info_msg_custom->header.stamp           = stamp;
-    info_msg_custom->header.frame_id        = frame_id_;
-    info_msg_custom->size                   = xi_img.size;
-    info_msg_custom->bp_size                = xi_img.bp_size;
-    info_msg_custom->frm                    = xi_img.frm;
-    info_msg_custom->width                  = xi_img.width;
-    info_msg_custom->height                 = xi_img.height;
-    info_msg_custom->nframe                 = xi_img.nframe;
-    info_msg_custom->acq_nframe             = xi_img.acq_nframe;
-    info_msg_custom->ts_sec                 = xi_img.tsSec;
-    info_msg_custom->ts_usec                = xi_img.tsUSec;
-    info_msg_custom->gpi_level              = xi_img.GPI_level;
-    info_msg_custom->black_level            = xi_img.black_level;
-    info_msg_custom->padding_x              = xi_img.padding_x;
-    info_msg_custom->absolute_offset_x      = xi_img.AbsoluteOffsetX;
-    info_msg_custom->absolute_offset_y      = xi_img.AbsoluteOffsetY;
-    info_msg_custom->exposure_time_us       = xi_img.exposure_time_us;
-    info_msg_custom->gain_db                = xi_img.gain_db;
-    info_msg_custom->image_user_data        = xi_img.image_user_data;
-    
-    xi_image_info_pub_->publish(std::move(info_msg_custom));
+      std_msgs::msg::UInt32 count_msg;
+      count_msg.data = ++frame_count_;
+      image_count_pub_->publish(count_msg);
+
+      if (publish_xi_image_info_) {
+        auto info_msg_custom = std::make_unique<ximea_ros2_cam::msg::XiImageInfo>();
+        info_msg_custom->header.stamp           = stamp;
+        info_msg_custom->header.frame_id        = frame_id_;
+        info_msg_custom->size                   = xi_img.size;
+        info_msg_custom->bp_size                = xi_img.bp_size;
+        info_msg_custom->frm                    = xi_img.frm;
+        info_msg_custom->width                  = xi_img.width;
+        info_msg_custom->height                 = xi_img.height;
+        info_msg_custom->nframe                 = xi_img.nframe;
+        info_msg_custom->acq_nframe             = xi_img.acq_nframe;
+        info_msg_custom->ts_sec                 = xi_img.tsSec;
+        info_msg_custom->ts_usec                = xi_img.tsUSec;
+        info_msg_custom->gpi_level              = xi_img.GPI_level;
+        info_msg_custom->black_level            = xi_img.black_level;
+        info_msg_custom->padding_x              = xi_img.padding_x;
+        info_msg_custom->absolute_offset_x      = xi_img.AbsoluteOffsetX;
+        info_msg_custom->absolute_offset_y      = xi_img.AbsoluteOffsetY;
+        info_msg_custom->exposure_time_us       = xi_img.exposure_time_us;
+        info_msg_custom->gain_db                = xi_img.gain_db;
+        info_msg_custom->image_user_data        = xi_img.image_user_data;
+
+        xi_image_info_pub_->publish(std::move(info_msg_custom));
+      }
+    } catch (const std::exception & e) {
+      if (stop_ || !rclcpp::ok()) return;   // context went away during shutdown
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Publish failed: %s", e.what());
+    }
+
+    const int64_t dur_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(steady::now() - t0).count();
+    int64_t prev = stat_publish_max_ns_.load();
+    while (dur_ns > prev && !stat_publish_max_ns_.compare_exchange_weak(prev, dur_ns)) {}
   }
 }
 

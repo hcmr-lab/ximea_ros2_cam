@@ -142,7 +142,15 @@ The driver supports two timestamp modes via `use_hardware_timestamps`:
 
 What hardware timestamps do **not** give you: a true "absolute exposure start in wallclock time". The anchor is set when the driver's callback runs (i.e. after delivery), so the delivery latency of the anchor frame is baked into every subsequent stamp. The mode preserves frame-to-frame precision, not absolute pipeline latency.
 
-### Re-anchoring
+### Min-latency anchoring (default with hardware timestamps)
+
+With `hw_anchor_min_latency: true` the stamp is `receipt time - (delivery lag of this frame beyond the least-delayed frame seen)`. A frame's delivery lag is measured against the camera clock, so a USB/queue/CPU backlog is not absorbed into the stamps the way a single anchor frame's latency would be. The remaining constant offset (USB transfer, readout) can be compensated with `timestamp_offset_s`.
+
+### Pipeline health
+
+Frames are grabbed in a dedicated thread and published from a second one; if the publisher falls behind, the older unpublished frame is replaced rather than queued. The driver logs a warning (at most every 5 s) only when frame lag exceeds `lag_warn_threshold_s` or frames were dropped before publishing.
+
+### Re-anchoring (legacy mode)
 
 Camera and host crystals tick at slightly different rates (typically ~10 ppm). Left alone, the anchor would drift indefinitely. The driver re-anchors every `hw_anchor_resync_period_s` seconds (default `60`) to keep drift bounded. Set to `0` to disable re-anchoring — fine for short runs or hardware-triggered setups where absolute drift doesn't matter.
 

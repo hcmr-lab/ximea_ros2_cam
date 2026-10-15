@@ -20,7 +20,7 @@
 | Parameter                | Type   | Default | Description |
 |--------------------------|--------|---------|-------------|
 | `poll_open_period_s`     | double | `2.0`   | Period of the open-device polling timer (seconds). Stagger this across cameras to avoid race on USB enumeration. |
-| `poll_frame_period_s`    | double | `0.001` | Period of the frame-grab timer. Set well below your target frame interval. |
+| `poll_frame_period_s`    | double | `0.001` | Deprecated and ignored. Frames are grabbed in a dedicated thread that blocks in `xiGetImage`. |
 | `img_capture_timeout_ms` | int    | `1000`  | Per-frame `xiGetImage` timeout in milliseconds. |
 
 ### Triggering
@@ -75,6 +75,7 @@ Values are snapped down to the nearest valid increment for the sensor.
 | `num_cams_in_bus`          | int    | `1`     | Number of cameras sharing the same USB controller. Available bandwidth is divided by this. |
 | `bw_safety_ratio`          | double | `0.9`   | Safety factor applied to allocated bandwidth (0 < r ≤ 1). Clamped if out of range. |
 | `transport_buffer_commit`  | int    | `32`    | `XI_PRM_ACQ_TRANSPORT_BUFFER_COMMIT` — number of in-flight USB requests. 32 is XIMEA's recommended value for Linux USB3. |
+| `buffers_queue_size`       | int    | `4`     | `XI_PRM_BUFFERS_QUEUE_SIZE`, clamped to the camera's range. Kept small so a slow consumer can't build seconds of latency. `<= 0` uses the camera's maximum. |
 | `recent_frame`             | bool   | `true`  | Discards old queue frames and returns only the freshest image via `XI_PRM_RECENT_FRAME`. |
 | `warmup_frames`            | int    | `10`    | Number of initial frames to discard during startup/reconnect before publishing and anchoring. |
 
@@ -82,6 +83,10 @@ Values are snapped down to the nearest valid increment for the sensor.
 
 | Parameter                   | Type   | Default | Description |
 |-----------------------------|--------|---------|-------------|
-| `use_hardware_timestamps`   | bool   | `false` | Use hardware timestamps (anchored to ROS time on first frame). Otherwise stamps with `node->now()` at receive time. |
-| `hw_anchor_resync_period_s` | double | `60.0`  | Re-anchor period when `use_hardware_timestamps: true`. Bounds clock-drift accumulation; `0.0` disables. Only takes effect when hardware timestamps are enabled. |
+| `use_hardware_timestamps`   | bool   | `false` | Use the camera's hardware clock for stamps (see `hw_anchor_min_latency`). Otherwise stamps with the host time right after `xiGetImage` returns. |
+| `hw_anchor_min_latency`     | bool   | `true`  | With hardware timestamps: stamp = receipt time minus how much later this frame was delivered than the least-delayed frame seen so far. A queue backlog cannot shift the stamps. `false` = legacy anchoring on a single frame, reset every `hw_anchor_resync_period_s`. |
+| `hw_clock_drift_ppm`        | double | `100.0` | Min-latency mode: how fast (ppm of camera time) the reference may creep upwards to follow camera/host clock drift. |
+| `timestamp_offset_s`        | double | `0.0`   | Added to every stamp (any mode). Negative moves stamps earlier, e.g. to compensate a measured constant delivery latency. |
+| `lag_warn_threshold_s`      | double | `0.25`  | Log a warning (at most every 5 s) when frame lag exceeds this, or when frames are dropped before publishing. `<= 0` disables the lag check. |
+| `hw_anchor_resync_period_s` | double | `60.0`  | Legacy mode only (`hw_anchor_min_latency: false`): re-anchor period. `0.0` disables. |
 | `publish_xi_image_info`     | bool   | `false` | Publish the `XiImageInfo` topic with per-frame xiAPI metadata. |

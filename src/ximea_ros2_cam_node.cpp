@@ -15,6 +15,9 @@ int main(int argc, char ** argv) {
   exec.add_node(node);
   exec.spin();
 
+  // Stop the capture/publish threads while the ROS context is still valid
+  exec.remove_node(node);
+  node.reset();
   rclcpp::shutdown();
   return 0;
 }
